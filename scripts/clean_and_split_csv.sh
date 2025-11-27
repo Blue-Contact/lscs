@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# chmod +x clean_and_split_csv.sh
+# ./clean_and_split_csv.sh example.csv 200000
+
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
