@@ -17,7 +17,7 @@ aws glue start-job-run \
   --job-name consumer-match-job \
   --arguments '{
       "--INPUT_TABLE": "database_name.table_name",
-      "--MATCH_TABLE": "database_name.table_name_to_match_against",
+      "--MATCH_TABLE": "source_a.consumer",
       "--OUTPUT_PATH": "s3://lsc-databases/clients/<my-new-table-location>/",
       "--OUTPUT_TABLE": "<target-database>.<target-table>",
       "--MATCH_THRESHOLD": "92",
