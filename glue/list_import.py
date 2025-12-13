@@ -11,24 +11,49 @@ from awsgluedq.transforms import EvaluateDataQuality
 
 from pyspark.sql import functions as F
 
+
+def normalize_delimiter(raw_value: str) -> str:
+    """
+    Convert user input (e.g., pipe, tab, \\t) to the actual delimiter character.
+    Defaults to the raw string if no special handling is required.
+    """
+    if raw_value is None:
+        return ","
+
+    token = raw_value.lower()
+    if token == "tab":
+        return "\t"
+    if token == "pipe":
+        return "|"
+
+    # Allow escape sequences like "\t" to be supplied via job parameters.
+    try:
+        return raw_value.encode("utf-8").decode("unicode_escape")
+    except UnicodeDecodeError:
+        return raw_value
+
+
 # -----------------------------------------------------------------------------------
 # Read job parameters
 # -----------------------------------------------------------------------------------
-args = getResolvedOptions(
-    sys.argv,
-    [
-        "JOB_NAME",
-        "INPUT_S3_PATH",
-        "OUTPUT_S3_PATH",
-        "OUTPUT_DATABASE",
-        "OUTPUT_TABLE",
-    ],
-)
+required_args = [
+    "JOB_NAME",
+    "INPUT_S3_PATH",
+    "OUTPUT_S3_PATH",
+    "OUTPUT_DATABASE",
+    "OUTPUT_TABLE",
+]
+optional_args = []
+if any(arg.startswith("--INPUT_DELIMITER") for arg in sys.argv):
+    optional_args.append("INPUT_DELIMITER")
+
+args = getResolvedOptions(sys.argv, required_args + optional_args)
 
 INPUT_S3_PATH   = args["INPUT_S3_PATH"]
 OUTPUT_S3_PATH  = args["OUTPUT_S3_PATH"]
 OUTPUT_DATABASE = args["OUTPUT_DATABASE"]
 OUTPUT_TABLE    = args["OUTPUT_TABLE"]
+INPUT_DELIMITER = normalize_delimiter(args.get("INPUT_DELIMITER"))
 
 # -----------------------------------------------------------------------------------
 # Glue / Spark Context
@@ -44,6 +69,7 @@ print(f"[INIT] INPUT_S3_PATH   = {INPUT_S3_PATH}")
 print(f"[INIT] OUTPUT_S3_PATH  = {OUTPUT_S3_PATH}")
 print(f"[INIT] OUTPUT_DATABASE = {OUTPUT_DATABASE}")
 print(f"[INIT] OUTPUT_TABLE    = {OUTPUT_TABLE}")
+print(f"[INIT] INPUT_DELIMITER = {repr(INPUT_DELIMITER)}")
 
 try:
     # -----------------------------------------------------------------------------------
@@ -72,7 +98,7 @@ try:
     header_row = lines_df.first()[0]
     print(f"[STEP 2] Header row (truncated to 200 chars): {header_row[:200]}")
 
-    reader = csv.reader(StringIO(header_row))
+    reader = csv.reader(StringIO(header_row), delimiter=INPUT_DELIMITER)
     header_cols = next(reader)
 
     header_cols = [col.strip().strip('"') for col in header_cols]
@@ -101,7 +127,7 @@ try:
             F.col("value"),
             schema_ddl,  # DDL string, not StructType
             {
-                "delimiter": ",",
+                "delimiter": INPUT_DELIMITER,
                 "quote": "\"",
                 "escape": "\"",
                 # header option is ignored by from_csv; header handled manually
