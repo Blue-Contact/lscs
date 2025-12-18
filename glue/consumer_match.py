@@ -522,20 +522,36 @@ try:
     input_first_col = get_input_column_name('first_name')
     input_last_col = get_input_column_name('last_name')
     input_address_col = get_input_column_name('address')
+    input_zip_col = get_input_column_name('zip')
+    input_zip4_col = get_input_column_name('zip4')
+
+    input_zip_clean = trim(coalesce(col(input_zip_col).cast("string"), lit("")))
+    input_zip4_clean = trim(coalesce(col(input_zip4_col).cast("string"), lit("")))
+    input_zip_5 = substring(input_zip_clean, 1, 5)
+    input_zip4_4 = substring(input_zip4_clean, 1, 4)
     
     input_df = input_df.select(
         "*",
         coalesce(col(input_first_col), lit("")).alias("first_name_norm"),
         coalesce(col(input_last_col), lit("")).alias("last_name_norm"),
-        coalesce(col(input_address_col), lit("")).alias("address_norm")
+        coalesce(col(input_address_col), lit("")).alias("address_norm"),
+        when(length(input_zip_5) == 0, lit("")).otherwise(lpad(input_zip_5, 5, "0")).alias("zip_norm"),
+        when(length(input_zip4_4) == 0, lit("")).otherwise(lpad(input_zip4_4, 4, "0")).alias("zip4_norm")
     )
+
+    match_zip_clean = trim(coalesce(col("zip").cast("string"), lit("")))
+    match_zip4_clean = trim(coalesce(col("zip4").cast("string"), lit("")))
+    match_zip_5 = substring(match_zip_clean, 1, 5)
+    match_zip4_4 = substring(match_zip4_clean, 1, 4)
 
     # Normalize case for match data and ensure no nulls
     match_df = match_df.select(
         "*",
         coalesce(col("first_name"), lit("")).alias("first_name_norm"),
         coalesce(col("last_name"), lit("")).alias("last_name_norm"),
-        coalesce(col("address"), lit("")).alias("address_norm")
+        coalesce(col("address"), lit("")).alias("address_norm"),
+        when(length(match_zip_5) == 0, lit("")).otherwise(lpad(match_zip_5, 5, "0")).alias("zip_norm"),
+        when(length(match_zip4_4) == 0, lit("")).otherwise(lpad(match_zip4_4, 4, "0")).alias("zip4_norm")
     )
 
     # Create temporary views
@@ -554,8 +570,6 @@ try:
     
     logger.info("Performing advanced fuzzy matching...")
     # Perform fuzzy matching with optimized join using column mapping
-    input_zip_col = get_input_column_name('zip')
-    input_zip4_col = get_input_column_name('zip4')
     
     result_df = spark.sql(f"""
         WITH first_name_matches AS (
@@ -570,14 +584,16 @@ try:
                 c.address_norm               AS match_address_norm,
                 c.zip                        AS match_zip,
                 c.zip4                       AS match_zip4,
+                c.zip_norm                   AS match_zip_norm,
+                c.zip4_norm                  AS match_zip4_norm,
                 CASE 
                     WHEN i.first_name_norm = '' OR c.first_name_norm = '' THEN 0
                     ELSE fuzzy_name_match_udf(i.first_name_norm, c.first_name_norm, false, 0)
                 END                          AS raw_first_name_score
             FROM input_data i
             LEFT JOIN match_data c
-              ON i.{input_zip_col} = c.zip 
-             AND i.{input_zip4_col} = c.zip4
+              ON i.zip_norm = c.zip_norm
+             AND i.zip4_norm = c.zip4_norm
         ),
         address_matches AS (
             SELECT 
@@ -594,14 +610,14 @@ try:
                 CASE 
                     WHEN f.address_norm = '' 
                       OR f.match_address_norm = '' 
-                      OR f.{input_zip_col} IS NULL 
-                      OR f.match_zip IS NULL 
+                      OR f.zip_norm = '' 
+                      OR f.match_zip_norm = '' 
                     THEN 0
                     ELSE fuzzy_address_match_udf(
                            f.address_norm,
                            f.match_address_norm,
-                           f.{input_zip_col},
-                           f.match_zip
+                           f.zip_norm,
+                           f.match_zip_norm
                          )
                 END                          AS raw_address_score
             FROM first_name_matches f
