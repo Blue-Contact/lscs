@@ -90,3 +90,25 @@ aws glue start-job-run \
 
 - The match table (`MATCH_TABLE`) is expected to have at least: `id`, `first_name`, `last_name`, `address`, `state`, `zip`, `zip4`.
 - Matching currently blocks on `zip_norm` + `zip4_norm` (same as the original matcher logic).
+
+### CSV header naming best practices (Glue / Athena)
+
+Glue Data Catalog + Athena are happiest when CSV headers are already “catalog-safe”. If headers include spaces or punctuation, Glue may auto-sanitize and (depending on the situation) append `#<n>` to produce deterministic names (e.g. `finder_number#20`).
+
+- **Do**: use lowercase `snake_case` with only `[a-z0-9_]`
+  - Examples: `first_name`, `last_name`, `primary_address`, `zip_4_code`, `finder_number`
+- **Do**: ensure headers are unique after normalization
+  - Example: `zip` and `ZIP` collide once lowercased
+- **Don’t**: use spaces or punctuation in header names
+  - Avoid: `LAST NAME`, `ZIP+4 CODE`, `DELIVERY POINT BARCODE`
+- **Don’t**: start names with a digit (prefix with `_` instead)
+  - Avoid: `1st_address` → prefer `_1st_address` or `address_1`
+
+**Header “before → after” examples**
+
+- `LAST NAME` → `last_name`
+- `ZIP+4 CODE` → `zip_4_code`
+- `DELIVERY POINT BARCODE` → `delivery_point_barcode`
+- `FINDER NUMBER` → `finder_number`
+
+**Note:** The import jobs in this repo now sanitize headers to safe, unique names during ingest, but providing catalog-safe headers up front keeps the schema stable across tools and avoids surprises when querying in Athena.
