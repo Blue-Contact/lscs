@@ -1,4 +1,4 @@
-# lscs
+# LSCS
 
 AWS Glue jobs and helper scripts for LSC.
 
