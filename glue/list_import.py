@@ -2,6 +2,10 @@ import sys
 import csv
 from io import StringIO
 
+import json
+import re
+import time
+
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
@@ -10,6 +14,71 @@ from awsglue.dynamicframe import DynamicFrame
 from awsgluedq.transforms import EvaluateDataQuality
 
 from pyspark.sql import functions as F
+
+
+def _agent_log(message: str, data: dict, *, hypothesisId: str, runId: str = "pre-fix", location: str = "glue/list_import.py") -> None:
+    # #region agent log
+    payload = {
+        "sessionId": "debug-session",
+        "runId": runId,
+        "hypothesisId": hypothesisId,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    # Always emit to stdout so this works in AWS Glue logs too.
+    try:
+        print("[AGENT_LOG] " + json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        pass
+    try:
+        with open("/Users/jmclachlan/gh/lscs/.cursor/debug.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        # Don't break Glue jobs if local debug sink isn't available.
+        pass
+    # #endregion
+
+
+def _catalog_safe_name(raw: str) -> str:
+    """
+    Approximate Glue/Hive-friendly column names:
+      - lowercase
+      - replace non [a-z0-9_] with _
+      - collapse underscores
+      - trim underscores
+      - prefix leading digits with _
+    """
+    if raw is None:
+        return ""
+    s = str(raw).strip().lower()
+    s = re.sub(r"[^a-z0-9_]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    if s and s[0].isdigit():
+        s = "_" + s
+    return s
+
+
+def _make_unique(names: list[str]) -> list[str]:
+    """
+    Make names unique by suffixing _2, _3, ... (never uses '#').
+    Empty names become col_<index>.
+    """
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for i, n in enumerate(names):
+        base = (n or "").strip()
+        if not base:
+            base = f"col_{i+1}"
+        k = base
+        if k in seen:
+            seen[k] += 1
+            k = f"{base}_{seen[base]}"
+        else:
+            seen[k] = 1
+        out.append(k)
+    return out
 
 
 def normalize_delimiter(raw_value: str) -> str:
@@ -104,9 +173,56 @@ try:
     header_cols = [col.strip().strip('"') for col in header_cols]
     print(f"[STEP 2] Detected {len(header_cols)} column(s) from header.")
     print(f"[STEP 2] First 10 column names: {header_cols[:10]}")
+    try:
+        safe = [_catalog_safe_name(c) for c in header_cols]
+        dup_safe = sorted({n for n in safe if n and safe.count(n) > 1})
+        _agent_log(
+            "Header parsed",
+            {
+                "header_col_count": len(header_cols),
+                "header_first_10": header_cols[:10],
+                "catalog_safe_first_10": safe[:10],
+                "catalog_safe_dup_count": len(dup_safe),
+                "catalog_safe_dups_first_20": dup_safe[:20],
+            },
+            hypothesisId="B",
+            location="glue/list_import.py:STEP2",
+        )
+    except Exception:
+        pass
 
-    schema_ddl = ", ".join(f"`{name}` STRING" for name in header_cols)
+    # Use Glue/Athena-friendly column names to avoid downstream sanitizers.
+    safe_cols = _make_unique([_catalog_safe_name(c) for c in header_cols])
+    # Keep a mapping for traceability in logs.
+    mapping_preview = list(zip(header_cols[:20], safe_cols[:20]))
+    _agent_log(
+        "Column name mapping (original -> safe)",
+        {
+            "mapping_preview_first_20": mapping_preview,
+            "safe_col_count": len(safe_cols),
+            "safe_cols_first_20": safe_cols[:20],
+            "safe_cols_unique": len(set(safe_cols)) == len(safe_cols),
+        },
+        hypothesisId="C",
+        location="glue/list_import.py:STEP2",
+    )
+
+    # Important: Spark will still show `colName#123` in *plans*; the `#123` is NOT part of the column name.
+    _agent_log(
+        "Note: Spark plans show exprIds like col#123 (not column name)",
+        {},
+        hypothesisId="A",
+        location="glue/list_import.py:STEP2",
+    )
+
+    schema_ddl = ", ".join(f"`{name}` STRING" for name in safe_cols)
     print(f"[STEP 2] Schema DDL (truncated to 300 chars): {schema_ddl[:300]}")
+    _agent_log(
+        "Schema DDL built",
+        {"schema_ddl_len": len(schema_ddl), "schema_ddl_prefix": schema_ddl[:300]},
+        hypothesisId="B",
+        location="glue/list_import.py:STEP2",
+    )
 
     # -----------------------------------------------------------------------------------
     # 3) Drop header lines and parse rows with from_csv()
@@ -141,6 +257,27 @@ try:
     print(f"[STEP 3] Parsed {raw_count} row(s) into columns from CSV.")
     print("[STEP 3] Raw parsed schema:")
     df_raw.printSchema()
+    _agent_log(
+        "Parsed DF columns",
+        {
+            "df_raw_col_count": len(df_raw.columns),
+            "df_raw_first_20_cols": df_raw.columns[:20],
+            "df_raw_has_hash_in_any_colname": any("#" in c for c in df_raw.columns),
+        },
+        hypothesisId="A",
+        location="glue/list_import.py:STEP3",
+    )
+    try:
+        # Spark plans often render attributes as `colName#exprId`; that suffix is NOT part of the column name.
+        analyzed = df_raw._jdf.queryExecution().analyzed().toString()
+        _agent_log(
+            "Analyzed plan (prefix)",
+            {"analyzed_prefix": analyzed[:600]},
+            hypothesisId="A",
+            location="glue/list_import.py:STEP3",
+        )
+    except Exception:
+        pass
 
     print("[STEP 3] Sample of first 5 parsed rows:")
     df_raw.show(5, truncate=False)

@@ -77,6 +77,46 @@ def sql_ident(name: str) -> str:
     return f"`{escaped}`"
 
 
+def _catalog_safe_name(raw: str) -> str:
+    """
+    Approximate Glue/Athena-friendly column names:
+      - lowercase
+      - replace non [a-z0-9_] with _
+      - collapse underscores
+      - trim underscores
+      - prefix leading digits with _
+    """
+    if raw is None:
+        return ""
+    s = str(raw).strip().lower()
+    s = re.sub(r"[^a-z0-9_]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    if s and s[0].isdigit():
+        s = "_" + s
+    return s
+
+
+def _make_unique(names: list[str]) -> list[str]:
+    """
+    Make names unique by suffixing _2, _3, ... (never uses '#').
+    Empty names become col_<index>.
+    """
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for i, n in enumerate(names):
+        base = (n or "").strip()
+        if not base:
+            base = f"col_{i+1}"
+        k = base
+        if k in seen:
+            seen[k] += 1
+            k = f"{base}_{seen[base]}"
+        else:
+            seen[k] = 1
+        out.append(k)
+    return out
+
+
 class NameMatcher:
     """Class to handle advanced name matching logic with multiple algorithms."""
 
@@ -334,9 +374,25 @@ spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args["JOB_NAME"], args)
 
+# Filled after header parsing so INPUT_COLUMN_MAPPING can refer to either original
+# header names (e.g. "FINDER NUMBER") or sanitized names (e.g. "finder_number").
+HEADER_ORIG_TO_SAFE: dict[str, str] = {}
+HEADER_SAFE_SET: set[str] = set()
+
 
 def get_input_column_name(standard_col_name: str) -> str:
-    return input_column_mapping.get(standard_col_name, standard_col_name)
+    mapped = input_column_mapping.get(standard_col_name, standard_col_name)
+    # If mapping refers to original header, translate to safe name.
+    if mapped in HEADER_ORIG_TO_SAFE:
+        return HEADER_ORIG_TO_SAFE[mapped]
+    # If mapping already safe, keep it.
+    if mapped in HEADER_SAFE_SET:
+        return mapped
+    # Best-effort: if they passed something close, try sanitizing.
+    candidate = _catalog_safe_name(mapped)
+    if candidate in HEADER_SAFE_SET:
+        return candidate
+    return mapped
 
 
 metrics_start = time.time()
@@ -369,7 +425,15 @@ try:
     logger.info(f"[STEP 2] Detected {len(header_cols)} column(s) from header.")
     logger.info(f"[STEP 2] First 10 column names: {header_cols[:10]}")
 
-    schema_ddl = ", ".join(f"{sql_ident(name)} STRING" for name in header_cols)
+    # Build catalog-safe column names to prevent Glue from appending `#<n>` during catalog updates.
+    safe_cols = _make_unique([_catalog_safe_name(c) for c in header_cols])
+    HEADER_ORIG_TO_SAFE = dict(zip(header_cols, safe_cols))
+    HEADER_SAFE_SET = set(safe_cols)
+
+    mapping_preview = list(zip(header_cols[:20], safe_cols[:20]))
+    logger.info(f"[STEP 2] Column name mapping (original -> safe), first 20: {mapping_preview}")
+
+    schema_ddl = ", ".join(f"{sql_ident(name)} STRING" for name in safe_cols)
     logger.info(f"[STEP 2] Schema DDL (truncated to 300 chars): {schema_ddl[:300]}")
 
     # -----------------------------------------------------------------------------------
