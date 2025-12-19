@@ -62,8 +62,8 @@ aws glue start-job-run \
   --arguments '{
     "--INPUT_S3_PATH": "s3://lsc-databases/clients/telebrands_list_202511/input/list.csv",
     "--MATCH_TABLE": "source_a.consumer_data",
-    "--OUTPUT_PATH": "s3://lsc-databases/clients/telebrands_list_202511_matched/",
-    "--OUTPUT_TABLE": "clients.telebrands_list_202511_matched",
+    "--OUTPUT_PATH": "s3://lsc-databases/clients/telebrands_list/",
+    "--OUTPUT_TABLE": "clients.telebrands_list",
     "--MATCH_THRESHOLD": "92",
     "--INPUT_COLUMN_MAPPING": "{\"first_name\":\"firstname\",\"last_name\":\"lastname\",\"address\":\"street\",\"city\":\"city\",\"state\":\"state\",\"zip\":\"zipcode\",\"zip4\":\"plus4\"}"
   }'
