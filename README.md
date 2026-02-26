@@ -21,6 +21,7 @@ The output table includes:
   - `match_id`, `match_first_name`, `match_last_name`, `match_address`, `match_zip`, `match_zip4`
   - `match_first_name_score`, `match_last_name_score`, `match_address_score`
   - `match_type`, `match_overall_score`
+- Optional match-table columns when `MATCH_APPEND_COLUMNS` is set (original column names)
 
 ### Arguments
 
@@ -39,6 +40,10 @@ Optional:
 
 - `--INPUT_DELIMITER` (defaults to `,`; supports `tab`, `pipe`, or escape sequences like `\\t`)
 - `--STATE_FILTER` (2-letter code; filters both input + match datasets for testing)
+- `--MATCH_APPEND_COLUMNS` (default: match columns only; use `ALL` or a comma list like `age,gender`)
+  - `ALL` appends all `MATCH_TABLE` columns (including `first_name`, `last_name`, `address`, `zip`, `zip4`)
+  - Columns that would duplicate existing output names are prefixed with `matched_`
+  - If `matched_` still collides, the job suffixes `_2`, `_3`, etc.
 
 ### Glue dependencies
 
@@ -90,6 +95,79 @@ aws glue start-job-run \
 
 - The match table (`MATCH_TABLE`) is expected to have at least: `id`, `first_name`, `last_name`, `address`, `state`, `zip`, `zip4`.
 - Matching currently blocks on `zip_norm` + `zip4_norm` (same as the original matcher logic).
+
+## Glue job: `glue/list_import_and_match_keys.py`
+
+Single Glue job that **imports a delimited list file from S3** and then **matches each row to a consumer key table** using exact key matching (email/phone/address). Name validation uses the same fuzzy name matching UDFs as `list_import_and_match.py`.
+
+### What it does
+
+- **Ingest**: identical to `list_import_and_match.py` (header-driven CSV parsing, all STRING columns).
+- **Key match**: matches on normalized `key` + `key_type` (email/phone/address).
+- **Name validation**:
+  - `INDIVIDUAL_MATCH`: first + last name scores >= `MATCH_THRESHOLD`
+  - `HOUSEHOLD_MATCH`: last name score >= `MATCH_THRESHOLD`, first name below
+  - `KEY_MATCH`: key matched but name threshold not met
+- **Output**: writes Parquet to `OUTPUT_PATH` and creates/ensures `OUTPUT_TABLE` at that location.
+
+### Output columns
+
+The output table includes:
+
+- **All imported columns** from the input file
+- Match result columns:
+  - `match_consumer_id`, `match_uuid`, `match_key`, `match_key_type`
+  - `match_first`, `match_last`
+  - `match_first_name_score`, `match_last_name_score`
+  - `match_type`, `match_date`
+- Optional match-table columns when `MATCH_APPEND_COLUMNS` is set (original column names)
+
+### Arguments
+
+Required:
+
+- `--JOB_NAME`
+- `--INPUT_S3_PATH` (S3 path to delimited text file; first row must be header)
+- `--MATCH_TABLE` (Glue table with `key` + `key_type`, e.g. `source_a.consumer_key`)
+- `--OUTPUT_PATH` (S3 prefix for output Parquet)
+- `--OUTPUT_TABLE` (Glue table name including database)
+- `--MATCH_THRESHOLD` (0–100, e.g. `92`)
+- `--INPUT_COLUMN_MAPPING` (JSON mapping from standard names to input-file column names)
+  - required standard keys: `first_name`, `last_name`
+  - key sources:
+    - `email` (comma list or JSON array)
+    - `phone` (comma list or JSON array)
+    - `address` + `zip` (address key is `"<street> <zip5>"`)
+  - at least one of `email`, `phone`, or `address`+`zip` is required
+
+Optional:
+
+- `--INPUT_DELIMITER` (defaults to `,`; supports `tab`, `pipe`, or escape sequences like `\\t`)
+- `--STATE_FILTER` (2-letter code; filters both input + match datasets for testing)
+- `--MATCH_APPEND_COLUMNS` (default: match columns only; use `ALL` or a comma list like `age,gender`)
+
+### Glue dependencies
+
+This job requires the same additional python modules as `list_import_and_match.py`:
+
+- `nicknames==0.1.0`
+- `jellyfish==0.9.0`
+- `rapidfuzz==3.6.1`
+
+### Usage example
+
+```bash
+aws glue start-job-run \
+  --job-name list-import-and-match-keys \
+  --arguments '{
+    "--INPUT_S3_PATH": "s3://lsc-databases/clients/my_list/input/list.csv",
+    "--MATCH_TABLE": "source_a.consumer_key",
+    "--OUTPUT_PATH": "s3://lsc-databases/clients/my_list_matched/",
+    "--OUTPUT_TABLE": "clients.my_list_matched",
+    "--MATCH_THRESHOLD": "92",
+    "--INPUT_COLUMN_MAPPING": "{\"first_name\":\"first\",\"last_name\":\"last\",\"email\":\"email,alt_email\",\"phone\":[\"phone\",\"mobile\"],\"address\":\"street\",\"zip\":\"zip\"}"
+  }'
+```
 
 ### CSV header naming best practices (Glue / Athena)
 

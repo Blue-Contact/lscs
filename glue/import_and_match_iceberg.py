@@ -10,18 +10,19 @@ Contract (consumer_match style output):
     - INPUT_S3_PATH
     - MATCH_TABLE
     - OUTPUT_PATH
-    - OUTPUT_TABLE  (datasouce.database.table)
+    - OUTPUT_TABLE  (database.table)
     - MATCH_THRESHOLD
     - INPUT_COLUMN_MAPPING (JSON mapping from standard names to input file columns)
   Optional:
     - INPUT_DELIMITER (defaults to ",", supports "tab", "pipe", or escape sequences like "\\t")
     - STATE_FILTER (2-letter code; filters both input and match datasets for testing)
-    - MATCH_APPEND_COLUMNS (default: match columns only; use "ALL" or comma list)
+    - MATCH_APPEND_COLUMNS (defaults to "ALL"; can be "NONE" or comma-separated list)
+    - ICEBERG_CATALOG (defaults to "glue_catalog"; catalog name configured via Spark conf)
+    - ICEBERG_REQUIRE_CATALOG (defaults to "TRUE"; fail fast if catalog not configured)
 
 Output:
   Writes Parquet to OUTPUT_PATH and creates/ensures Glue table OUTPUT_TABLE at that location.
-  Output includes all imported columns plus match result columns, and optionally extra
-  match-table columns when MATCH_APPEND_COLUMNS is specified.
+  Output includes all imported columns plus match result columns.
 """
 
 import sys
@@ -31,7 +32,6 @@ import re
 import time
 import logging
 from io import StringIO
-from typing import Optional
 
 from rapidfuzz import fuzz
 import jellyfish
@@ -120,34 +120,42 @@ def _make_unique(names: list[str]) -> list[str]:
     return out
 
 
-def parse_match_append_columns(raw_value: Optional[str]) -> tuple[str, list[str]]:
+def qualify_table_for_catalog(table_name: str, catalog: str) -> str:
     """
-    Parse MATCH_APPEND_COLUMNS.
-    Returns (mode, columns) where mode is: default | all | list.
+    If table_name is "db.table", return "{catalog}.db.table".
+    If table_name is already 3-part (catalog.db.table), return as-is.
     """
-    if raw_value is None:
-        return "default", []
-    token = str(raw_value).strip()
-    if not token:
-        return "default", []
-    if token.upper() == "ALL":
-        return "all", []
-    cols = [c.strip() for c in token.split(",") if c.strip()]
-    if not cols:
-        return "default", []
-    return "list", cols
+    t = (table_name or "").strip()
+    if not t:
+        raise ValueError("MATCH_TABLE cannot be empty")
+    parts = [p for p in t.split(".") if p]
+    if len(parts) == 2:
+        return f"{catalog}.{t}"
+    return t
 
 
-def make_unique_name(base: str, taken: set[str]) -> str:
-    """Return a unique name, suffixing _2, _3, ... if needed (case-insensitive)."""
-    if base.lower() not in taken:
-        return base
-    suffix = 2
-    candidate = f"{base}_{suffix}"
-    while candidate.lower() in taken:
-        suffix += 1
-        candidate = f"{base}_{suffix}"
-    return candidate
+def require_catalog_configured(spark, catalog: str):
+    """
+    Fail fast if Iceberg catalog isn't wired in this Spark session.
+    This avoids confusing Hive-metastore errors like StorageDescriptor#InputFormat cannot be null.
+    """
+    try:
+        catalogs = [r["catalog"] for r in spark.sql("SHOW CATALOGS").collect()]
+    except Exception:
+        catalogs = []
+    if catalog not in catalogs:
+        raise RuntimeError(
+            f"Iceberg catalog '{catalog}' is not configured in this Spark session.\n"
+            "Fix: add Spark confs in the Glue Job (Advanced properties -> Spark configuration) and set:\n"
+            "  --datalake-formats=iceberg\n"
+            "and Spark confs like:\n"
+            f"  --conf spark.sql.catalog.{catalog}=org.apache.iceberg.spark.SparkCatalog\n"
+            f"  --conf spark.sql.catalog.{catalog}.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog\n"
+            f"  --conf spark.sql.catalog.{catalog}.io-impl=org.apache.iceberg.aws.s3.S3FileIO\n"
+            f"  --conf spark.sql.catalog.{catalog}.warehouse=s3://YOUR-BUCKET/iceberg-warehouse/\n"
+            "  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions\n"
+            f"  --conf spark.sql.defaultCatalog={catalog}\n"
+        )
 
 
 class NameMatcher:
@@ -368,6 +376,10 @@ if any(arg.startswith("--STATE_FILTER") for arg in sys.argv):
     optional_args.append("STATE_FILTER")
 if any(arg.startswith("--MATCH_APPEND_COLUMNS") for arg in sys.argv):
     optional_args.append("MATCH_APPEND_COLUMNS")
+if any(arg.startswith("--ICEBERG_CATALOG") for arg in sys.argv):
+    optional_args.append("ICEBERG_CATALOG")
+if any(arg.startswith("--ICEBERG_REQUIRE_CATALOG") for arg in sys.argv):
+    optional_args.append("ICEBERG_REQUIRE_CATALOG")
 
 args = getResolvedOptions(sys.argv, required_args + optional_args)
 
@@ -379,8 +391,10 @@ MATCH_THRESHOLD = int(args["MATCH_THRESHOLD"])
 INPUT_COLUMN_MAPPING_RAW = args["INPUT_COLUMN_MAPPING"]
 INPUT_DELIMITER = normalize_delimiter(args.get("INPUT_DELIMITER"))
 STATE_FILTER = args.get("STATE_FILTER")
-MATCH_APPEND_COLUMNS_RAW = args.get("MATCH_APPEND_COLUMNS")
-match_append_mode, match_append_requested = parse_match_append_columns(MATCH_APPEND_COLUMNS_RAW)
+MATCH_APPEND_COLUMNS = str(args.get("MATCH_APPEND_COLUMNS", "NONE")).strip()
+ICEBERG_CATALOG = str(args.get("ICEBERG_CATALOG", "glue_catalog")).strip()
+ICEBERG_REQUIRE_CATALOG = str(args.get("ICEBERG_REQUIRE_CATALOG", "TRUE")).strip().upper()
+
 if STATE_FILTER:
     STATE_FILTER = STATE_FILTER.upper().strip()
     if len(STATE_FILTER) != 2:
@@ -399,16 +413,10 @@ logger.info(f"[INIT] OUTPUT_PATH        = {OUTPUT_PATH}")
 logger.info(f"[INIT] OUTPUT_TABLE       = {OUTPUT_TABLE}")
 logger.info(f"[INIT] MATCH_THRESHOLD    = {MATCH_THRESHOLD}")
 logger.info(f"[INIT] STATE_FILTER       = {STATE_FILTER}")
+logger.info(f"[INIT] MATCH_APPEND_COLUMNS = {MATCH_APPEND_COLUMNS}")
+logger.info(f"[INIT] ICEBERG_CATALOG    = {ICEBERG_CATALOG}")
+logger.info(f"[INIT] ICEBERG_REQUIRE_CATALOG = {ICEBERG_REQUIRE_CATALOG}")
 logger.info(f"[INIT] INPUT_COLUMN_MAPPING = {input_column_mapping}")
-if match_append_mode == "default":
-    logger.info("[INIT] MATCH_APPEND_COLUMNS = default (match columns only)")
-elif match_append_mode == "all":
-    logger.info("[INIT] MATCH_APPEND_COLUMNS = ALL (append all match-table columns)")
-else:
-    logger.info(
-        f"[INIT] MATCH_APPEND_COLUMNS = list ({len(match_append_requested)}): "
-        f"{match_append_requested}"
-    )
 
 
 # -----------------------------------------------------------------------------------
@@ -444,6 +452,16 @@ def get_input_column_name(standard_col_name: str) -> str:
 metrics_start = time.time()
 
 try:
+    # -----------------------------------------------------------------------------------
+    # 0) Iceberg catalog sanity check (optional but recommended)
+    # -----------------------------------------------------------------------------------
+    if ICEBERG_REQUIRE_CATALOG in {"TRUE", "T", "YES", "Y", "1"}:
+        logger.info("[STEP 0] Verifying Iceberg catalog is configured...")
+        require_catalog_configured(spark, ICEBERG_CATALOG)
+
+    MATCH_TABLE_QUALIFIED = qualify_table_for_catalog(MATCH_TABLE, ICEBERG_CATALOG)
+    logger.info(f"[STEP 0] Qualified MATCH_TABLE = {MATCH_TABLE_QUALIFIED}")
+
     # -----------------------------------------------------------------------------------
     # 1) Read file(s) as plain text (NO spark.read.csv, NO schema inference)
     # -----------------------------------------------------------------------------------
@@ -542,7 +560,9 @@ try:
     # Optional: filter input by state for test runs
     if STATE_FILTER:
         input_state_col = get_input_column_name("state")
-        logger.info(f"[STEP 5] Filtering imported input to state={STATE_FILTER} using column={input_state_col}")
+        logger.info(
+            f"[STEP 5] Filtering imported input to state={STATE_FILTER} using column={input_state_col}"
+        )
         df_clean = df_clean.filter(F.upper(F.col(input_state_col)) == F.lit(STATE_FILTER))
 
     # -----------------------------------------------------------------------------------
@@ -574,14 +594,13 @@ try:
         .alias("zip4_norm"),
     )
 
+    # Read the Iceberg match table via the configured catalog
     if STATE_FILTER:
-        match_base_df = spark.sql(
-            f"SELECT * FROM {MATCH_TABLE} WHERE state = '{STATE_FILTER}'"
+        match_df = spark.sql(
+            f"SELECT * FROM {MATCH_TABLE_QUALIFIED} WHERE state = '{STATE_FILTER}'"
         )
     else:
-        match_base_df = spark.sql(f"SELECT * FROM {MATCH_TABLE}")
-
-    match_base_columns = match_base_df.columns
+        match_df = spark.sql(f"SELECT * FROM {MATCH_TABLE_QUALIFIED}")
 
     # Normalize match dataset
     match_zip_clean = F.trim(F.coalesce(F.col("zip").cast("string"), F.lit("")))
@@ -589,7 +608,7 @@ try:
     match_zip_5 = F.substring(match_zip_clean, 1, 5)
     match_zip4_4 = F.substring(match_zip4_clean, 1, 4)
 
-    match_df = match_base_df.select(
+    match_df = match_df.select(
         "*",
         F.coalesce(F.col("first_name"), F.lit("")).alias("first_name_norm"),
         F.coalesce(F.col("last_name"), F.lit("")).alias("last_name_norm"),
@@ -623,87 +642,6 @@ try:
     input_columns = [c for c in input_df.columns if not c.endswith("_norm")]
     select_input_cols = ", ".join([f"r.{sql_ident(c)}" for c in input_columns])
 
-    default_match_output_cols = [
-        "match_id",
-        "match_first_name",
-        "match_last_name",
-        "match_address",
-        "match_zip",
-        "match_zip4",
-        "match_first_name_score",
-        "match_last_name_score",
-        "match_address_score",
-        "match_type",
-        "match_overall_score",
-    ]
-    reserved_output_cols = {c.lower() for c in input_columns}
-    reserved_output_cols.update(c.lower() for c in default_match_output_cols)
-
-    match_col_map = {c.lower(): c for c in match_base_columns}
-    extra_match_cols: list[tuple[str, str]] = []
-    skipped_match_cols: list[str] = []
-    renamed_match_cols: list[str] = []
-    existing_output_cols = set(reserved_output_cols)
-
-    if match_append_mode == "all":
-        candidates = list(match_base_columns)
-    elif match_append_mode == "list":
-        candidates = []
-        for raw_col in match_append_requested:
-            actual = match_col_map.get(raw_col.lower())
-            if not actual:
-                skipped_match_cols.append(f"{raw_col} (not in match table)")
-                continue
-            candidates.append(actual)
-    else:
-        candidates = []
-
-    seen_lower: set[str] = set()
-    for col_name in candidates:
-        col_key = col_name.lower()
-        if col_key in seen_lower:
-            continue
-        seen_lower.add(col_key)
-        output_name = col_name
-        if output_name.lower() in existing_output_cols:
-            output_name = f"matched_{col_name}"
-        output_name = make_unique_name(output_name, existing_output_cols)
-        if output_name.lower() != col_name.lower():
-            renamed_match_cols.append(f"{col_name} -> {output_name}")
-        existing_output_cols.add(output_name.lower())
-        extra_match_cols.append((col_name, output_name))
-
-    if match_append_mode != "default":
-        if extra_match_cols:
-            logger.info(
-                "[STEP 6] Appending match table columns: "
-                f"{[output for _, output in extra_match_cols]}"
-            )
-        else:
-            logger.info("[STEP 6] No extra match table columns appended.")
-    if renamed_match_cols:
-        logger.info(
-            "[STEP 6] Renamed match table columns due to collisions: "
-            f"{renamed_match_cols}"
-        )
-    if skipped_match_cols:
-        logger.warning(f"[STEP 6] Skipped match table columns: {skipped_match_cols}")
-
-    extra_match_select = ""
-    if extra_match_cols:
-        extra_match_select = "\n                " + "\n                ".join(
-            [
-                f"c.{sql_ident(source)} AS {sql_ident(output)},"
-                for source, output in extra_match_cols
-            ]
-        )
-
-    extra_final_select = ""
-    if extra_match_cols:
-        extra_final_select = ",\n            " + ",\n            ".join(
-            [f"r.{sql_ident(output)}" for _, output in extra_match_cols]
-        )
-
     part_cols = ", ".join(
         [
             sql_ident(input_first_col),
@@ -729,7 +667,7 @@ try:
                 c.zip                        AS match_zip,
                 c.zip4                       AS match_zip4,
                 c.zip_norm                   AS match_zip_norm,
-                c.zip4_norm                  AS match_zip4_norm,{extra_match_select}
+                c.zip4_norm                  AS match_zip4_norm,
                 CASE
                     WHEN i.first_name_norm = '' OR c.first_name_norm = '' THEN 0
                     ELSE fuzzy_name_match_udf(i.first_name_norm, c.first_name_norm, false, 0)
@@ -822,7 +760,7 @@ try:
             r.raw_last_name_score     AS match_last_name_score,
             r.raw_address_score       AS match_address_score,
             r.match_type,
-            r.match_overall_score{extra_final_select}
+            r.match_overall_score
         FROM ranked_matches r
         WHERE r.match_rank = 1
         """
@@ -832,20 +770,92 @@ try:
     logger.info(f"[STEP 7] Result count: {result_count:,}")
 
     # -----------------------------------------------------------------------------------
-    # 8) Write output and register Glue table
+    # 7b) Append matched consumer columns (enrichment payload)
+    #     CHANGE: Always prefix appended match columns as matched_<col> to avoid collisions
+    # -----------------------------------------------------------------------------------
+    append_spec = MATCH_APPEND_COLUMNS.upper()
+    if append_spec not in {"", "NONE", "NO", "FALSE"}:
+        logger.info("[STEP 7B] Appending matched consumer columns to output...")
+
+        helper_match_columns = {
+            "first_name_norm",
+            "last_name_norm",
+            "address_norm",
+            "zip_norm",
+            "zip4_norm",
+        }
+        available_match_columns = [col for col in match_df.columns if col not in helper_match_columns]
+
+        if append_spec in {"ALL", "*"}:
+            selected_match_columns = available_match_columns
+        else:
+            requested_columns = [c.strip() for c in MATCH_APPEND_COLUMNS.split(",") if c.strip()]
+            selected_match_columns = [col for col in requested_columns if col in available_match_columns]
+            missing_requested = [col for col in requested_columns if col not in available_match_columns]
+            if missing_requested:
+                logger.warning(
+                    "[STEP 7B] MATCH_APPEND_COLUMNS skipped missing columns: %s",
+                    ", ".join(missing_requested),
+                )
+
+        if selected_match_columns:
+            base_columns = list(result_df.columns)
+            used_column_names = set(base_columns)
+
+            # Optional debug: show collisions (for visibility)
+            collisions = sorted(set(base_columns).intersection(set(selected_match_columns)))
+            if collisions:
+                logger.info("[STEP 7B] Detected match-column collisions with base output (will be prefixed): %s", collisions)
+
+            append_exprs = []
+            for match_col in selected_match_columns:
+                # Always prefix to avoid collisions with input/output columns (e.g., "language").
+                alias = f"matched_{match_col}"
+                counter = 2
+                while alias in used_column_names:
+                    alias = f"matched_{match_col}_{counter}"
+                    counter += 1
+                used_column_names.add(alias)
+                append_exprs.append(F.col(f"m.{match_col}").alias(alias))
+
+            base_exprs = [F.col(f"r.{col}").alias(col) for col in base_columns]
+            result_df = (
+                result_df.alias("r")
+                .join(match_df.alias("m"), F.col("r.match_id") == F.col("m.id"), "left")
+                .select(*base_exprs, *append_exprs)
+            )
+            logger.info(
+                "[STEP 7B] Added %d matched consumer columns (%d total output columns).",
+                len(append_exprs),
+                len(result_df.columns),
+            )
+        else:
+            logger.info("[STEP 7B] No matched consumer columns selected for append.")
+
+    # -----------------------------------------------------------------------------------
+    # 8) Write output and register Glue table (WITH schema)
     # -----------------------------------------------------------------------------------
     logger.info("[STEP 8] Writing results to Parquet and registering output table...")
-    result_df.write.format("parquet").option("compression", "snappy").mode("overwrite").save(
-        OUTPUT_PATH
+
+    # Write parquet files
+    result_df.write.format("parquet") \
+        .option("compression", "snappy") \
+        .mode("overwrite") \
+        .save(OUTPUT_PATH)
+
+    # Recreate Glue table with schema
+    spark.sql(f"DROP TABLE IF EXISTS {OUTPUT_TABLE}")
+
+    (
+        result_df.write
+        .mode("overwrite")
+        .format("parquet")
+        .option("path", OUTPUT_PATH)   # <-- important: ties the table to this S3 location
+        .saveAsTable(OUTPUT_TABLE)     # <-- writes schema into Glue catalog
     )
 
-    spark.sql(
-        f"""
-        CREATE TABLE IF NOT EXISTS {OUTPUT_TABLE}
-        USING parquet
-        LOCATION '{OUTPUT_PATH}'
-        """
-    )
+    logger.info("[STEP 8] Registered table %s at %s with %d columns",
+                OUTPUT_TABLE, OUTPUT_PATH, len(result_df.columns))
 
     elapsed = time.time() - metrics_start
     logger.info(f"[DONE] Job completed successfully in {elapsed:.2f}s")
@@ -854,5 +864,3 @@ try:
 except Exception as e:
     logger.error(f"[FATAL] Job failed with error: {str(e)}")
     raise
-
-

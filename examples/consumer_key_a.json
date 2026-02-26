@@ -1,0 +1,187 @@
+[
+  {
+    "Name": "consumer_id",
+    "Type": "string"
+  },
+  {
+    "Name": "uuid",
+    "Type": "string"
+  },
+  {
+    "Name": "key",
+    "Type": "string"
+  },
+  {
+    "Name": "key_type",
+    "Type": "string"
+  },
+  {
+    "Name": "first",
+    "Type": "string"
+  },
+  {
+    "Name": "last",
+    "Type": "string"
+  },
+  {
+    "Name": "suffix",
+    "Type": "string"
+  },
+  {
+    "Name": "std_address",
+    "Type": "string"
+  },
+  {
+    "Name": "std_address_1",
+    "Type": "string"
+  },
+  {
+    "Name": "std_address_2",
+    "Type": "string"
+  },
+  {
+    "Name": "std_city",
+    "Type": "string"
+  },
+  {
+    "Name": "std_state",
+    "Type": "string"
+  },
+  {
+    "Name": "std_zip",
+    "Type": "string"
+  },
+  {
+    "Name": "zip4",
+    "Type": "string"
+  },
+  {
+    "Name": "county_name",
+    "Type": "string"
+  },
+  {
+    "Name": "std_status",
+    "Type": "string"
+  },
+  {
+    "Name": "latitude",
+    "Type": "string"
+  },
+  {
+    "Name": "longitude",
+    "Type": "string"
+  },
+  {
+    "Name": "msa",
+    "Type": "string"
+  },
+  {
+    "Name": "income_range",
+    "Type": "string"
+  },
+  {
+    "Name": "home_owner",
+    "Type": "string"
+  },
+  {
+    "Name": "gender",
+    "Type": "string"
+  },
+  {
+    "Name": "age",
+    "Type": "string"
+  },
+  {
+    "Name": "age_range",
+    "Type": "string"
+  },
+  {
+    "Name": "marital_status",
+    "Type": "string"
+  },
+  {
+    "Name": "presence_of_children",
+    "Type": "string"
+  },
+  {
+    "Name": "number_of_children",
+    "Type": "string"
+  },
+  {
+    "Name": "occupation",
+    "Type": "string"
+  },
+  {
+    "Name": "home_value",
+    "Type": "string"
+  },
+  {
+    "Name": "dwelling_type",
+    "Type": "string"
+  },
+  {
+    "Name": "language",
+    "Type": "string"
+  },
+  {
+    "Name": "religion",
+    "Type": "string"
+  },
+  {
+    "Name": "networth",
+    "Type": "string"
+  },
+  {
+    "Name": "credit_range",
+    "Type": "string"
+  },
+  {
+    "Name": "ethnicity",
+    "Type": "string"
+  },
+  {
+    "Name": "pool_owner",
+    "Type": "string"
+  },
+  {
+    "Name": "length_of_residence",
+    "Type": "string"
+  },
+  {
+    "Name": "length_of_residence_range",
+    "Type": "string"
+  },
+  {
+    "Name": "birth_year",
+    "Type": "string"
+  },
+  {
+    "Name": "education_level",
+    "Type": "string"
+  },
+  {
+    "Name": "donor",
+    "Type": "string"
+  },
+  {
+    "Name": "veteran",
+    "Type": "string"
+  },
+  {
+    "Name": "source_id",
+    "Type": "string"
+  },
+  {
+    "Name": "source_type",
+    "Type": "string"
+  },
+  {
+    "Name": "segment_id",
+    "Type": "string"
+  },
+  {
+    "Name": "partition_0",
+    "Type": "string",
+    "PartitionKey": "Partition (0)"
+  }
+]

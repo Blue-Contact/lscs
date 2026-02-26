@@ -1,16 +1,16 @@
 """
-Combined Glue Job: List Import (S3 delimited text) + Consumer Match (fuzzy person matching)
+Combined Glue Job: List Import (S3 delimited text) + Consumer Key Match
 
-This script merges the ingest pattern from glue/list_import.py with the matching logic from
-glue/consumer_match.py.
+This script merges the ingest pattern from glue/list_import_and_match.py with
+key-based matching against a consumer key table (email/phone/address).
 
-Contract (consumer_match style output):
+Contract (key match output):
   Required:
     - JOB_NAME (Glue)
     - INPUT_S3_PATH
     - MATCH_TABLE
     - OUTPUT_PATH
-    - OUTPUT_TABLE  (datasouce.database.table)
+    - OUTPUT_TABLE (datasource.database.table)
     - MATCH_THRESHOLD
     - INPUT_COLUMN_MAPPING (JSON mapping from standard names to input file columns)
   Optional:
@@ -18,10 +18,31 @@ Contract (consumer_match style output):
     - STATE_FILTER (2-letter code; filters both input and match datasets for testing)
     - MATCH_APPEND_COLUMNS (default: match columns only; use "ALL" or comma list)
 
-Output:
-  Writes Parquet to OUTPUT_PATH and creates/ensures Glue table OUTPUT_TABLE at that location.
-  Output includes all imported columns plus match result columns, and optionally extra
-  match-table columns when MATCH_APPEND_COLUMNS is specified.
+INPUT_COLUMN_MAPPING:
+  Required standard keys: first_name, last_name
+  Key sources:
+    - email: may be a comma-separated list or JSON array of column names
+    - phone: may be a comma-separated list or JSON array of column names
+    - address + zip: used to build address key "<street> <zip5>"
+  At least one of email / phone / address+zip must be present.
+  Example:
+    {
+      "first_name": "first",
+      "last_name": "last",
+      "email": "email,alt_email",
+      "phone": ["phone", "mobile"],
+      "address": "street",
+      "zip": "zip"
+    }
+
+Matching:
+  - Exact key match on normalized key value and key_type (email/phone/address)
+  - Name validation uses fuzzy match UDFs from list_import_and_match.py
+  - Match types:
+      INDIVIDUAL_MATCH: first + last name scores >= MATCH_THRESHOLD
+      HOUSEHOLD_MATCH: last name score >= MATCH_THRESHOLD, first name below
+      KEY_MATCH: key matched but name threshold not met
+  - Adds match_date (run date) to output
 """
 
 import sys
@@ -75,7 +96,6 @@ def sql_ident(name: str) -> str:
     """Safely quote a Spark SQL identifier with backticks."""
     if name is None:
         raise ValueError("Identifier cannot be None")
-    # Escape any backticks by doubling them
     escaped = str(name).replace("`", "``")
     return f"`{escaped}`"
 
@@ -148,6 +168,53 @@ def make_unique_name(base: str, taken: set[str]) -> str:
         suffix += 1
         candidate = f"{base}_{suffix}"
     return candidate
+
+
+def parse_column_list(raw_value) -> list[str]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, list):
+        items = raw_value
+    else:
+        items = str(raw_value).split(",")
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        name = str(item).strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+    return out
+
+
+def normalize_email(col):
+    cleaned = F.lower(F.trim(F.coalesce(col, F.lit(""))))
+    return F.when(F.length(cleaned) == 0, F.lit(None)).otherwise(cleaned)
+
+
+def normalize_phone(col):
+    digits = F.regexp_replace(F.coalesce(col, F.lit("")), r"\D+", "")
+    digits = F.when(
+        (F.length(digits) == 11) & (F.substring(digits, 1, 1) == F.lit("1")),
+        F.substring(digits, 2, 10),
+    ).otherwise(digits)
+    return F.when(F.length(digits) == 0, F.lit(None)).otherwise(digits)
+
+
+def normalize_zip5(col):
+    digits = F.regexp_replace(F.coalesce(col, F.lit("")), r"\D+", "")
+    zip5 = F.substring(digits, 1, 5)
+    zip5 = F.when(F.length(zip5) == 0, F.lit(None)).otherwise(F.lpad(zip5, 5, "0"))
+    return zip5
+
+
+def normalize_text(col):
+    cleaned = F.regexp_replace(F.lower(F.trim(F.coalesce(col, F.lit("")))), r"\s+", " ")
+    return F.when(F.length(cleaned) == 0, F.lit(None)).otherwise(cleaned)
 
 
 class NameMatcher:
@@ -335,19 +402,6 @@ def fuzzy_match_name_with_first_name(name1, name2, is_last_name, first_name_scor
         return 0
 
 
-def fuzzy_match_address(addr1, addr2, zip1, zip2):
-    if addr1 is None or addr2 is None or zip1 is None or zip2 is None:
-        return 0
-
-    if zip1 != zip2:
-        return 0
-
-    addr1_norm = name_matcher.normalize_string(addr1)
-    addr2_norm = name_matcher.normalize_string(addr2)
-    score = name_matcher.get_best_match_score(addr1_norm, addr2_norm)
-    return int(score)
-
-
 # -----------------------------------------------------------------------------------
 # Read job parameters
 # -----------------------------------------------------------------------------------
@@ -381,6 +435,7 @@ INPUT_DELIMITER = normalize_delimiter(args.get("INPUT_DELIMITER"))
 STATE_FILTER = args.get("STATE_FILTER")
 MATCH_APPEND_COLUMNS_RAW = args.get("MATCH_APPEND_COLUMNS")
 match_append_mode, match_append_requested = parse_match_append_columns(MATCH_APPEND_COLUMNS_RAW)
+
 if STATE_FILTER:
     STATE_FILTER = STATE_FILTER.upper().strip()
     if len(STATE_FILTER) != 2:
@@ -428,17 +483,27 @@ HEADER_SAFE_SET: set[str] = set()
 
 def get_input_column_name(standard_col_name: str) -> str:
     mapped = input_column_mapping.get(standard_col_name, standard_col_name)
-    # If mapping refers to original header, translate to safe name.
     if mapped in HEADER_ORIG_TO_SAFE:
         return HEADER_ORIG_TO_SAFE[mapped]
-    # If mapping already safe, keep it.
     if mapped in HEADER_SAFE_SET:
         return mapped
-    # Best-effort: if they passed something close, try sanitizing.
     candidate = _catalog_safe_name(mapped)
     if candidate in HEADER_SAFE_SET:
         return candidate
     return mapped
+
+
+def resolve_input_column(raw_name: str) -> str:
+    if raw_name is None:
+        return ""
+    if raw_name in HEADER_ORIG_TO_SAFE:
+        return HEADER_ORIG_TO_SAFE[raw_name]
+    if raw_name in HEADER_SAFE_SET:
+        return raw_name
+    candidate = _catalog_safe_name(raw_name)
+    if candidate in HEADER_SAFE_SET:
+        return candidate
+    return raw_name
 
 
 metrics_start = time.time()
@@ -471,7 +536,6 @@ try:
     logger.info(f"[STEP 2] Detected {len(header_cols)} column(s) from header.")
     logger.info(f"[STEP 2] First 10 column names: {header_cols[:10]}")
 
-    # Build catalog-safe column names to prevent Glue from appending `#<n>` during catalog updates.
     safe_cols = _make_unique([_catalog_safe_name(c) for c in header_cols])
     HEADER_ORIG_TO_SAFE = dict(zip(header_cols, safe_cols))
     HEADER_SAFE_SET = set(safe_cols)
@@ -525,121 +589,228 @@ try:
     df_clean.show(5, truncate=False)
 
     # -----------------------------------------------------------------------------------
-    # 5) Validate mapping columns exist
+    # 5) Validate mapping columns and build key source lists
     # -----------------------------------------------------------------------------------
-    required_standard = ["first_name", "last_name", "address", "city", "state", "zip", "zip4"]
-    missing = []
+    logger.info("[STEP 5] Validating mapping columns and building key sources...")
+    required_standard = ["first_name", "last_name"]
+    missing_required = []
     for std in required_standard:
         actual = get_input_column_name(std)
         if actual not in df_clean.columns:
-            missing.append(f"{std}->{actual}")
-    if missing:
+            missing_required.append(f"{std}->{actual}")
+    if missing_required:
         raise ValueError(
-            "Imported file is missing required columns for matching (standard->input): "
-            + ", ".join(missing)
+            "Imported file is missing required columns (standard->input): "
+            + ", ".join(missing_required)
         )
+
+    input_first_col = get_input_column_name("first_name")
+    input_last_col = get_input_column_name("last_name")
+
+    email_raw = input_column_mapping.get("email")
+    if email_raw is None and "email" in df_clean.columns:
+        email_raw = "email"
+    email_cols = [resolve_input_column(c) for c in parse_column_list(email_raw)]
+
+    phone_raw = input_column_mapping.get("phone")
+    if phone_raw is None and "phone" in df_clean.columns:
+        phone_raw = "phone"
+    phone_cols = [resolve_input_column(c) for c in parse_column_list(phone_raw)]
+
+    address_col = None
+    zip_col = None
+    if "address" in input_column_mapping or "address" in df_clean.columns:
+        address_col = get_input_column_name("address")
+    if "zip" in input_column_mapping or "zip" in df_clean.columns:
+        zip_col = get_input_column_name("zip")
+
+    if (address_col and not zip_col) or (zip_col and not address_col):
+        raise ValueError("Address key requires BOTH address and zip columns in INPUT_COLUMN_MAPPING.")
+
+    missing_keys = []
+    missing_keys.extend([c for c in email_cols if c not in df_clean.columns])
+    missing_keys.extend([c for c in phone_cols if c not in df_clean.columns])
+    if address_col and address_col not in df_clean.columns:
+        missing_keys.append(address_col)
+    if zip_col and zip_col not in df_clean.columns:
+        missing_keys.append(zip_col)
+    if missing_keys:
+        raise ValueError(
+            "Input file is missing key columns referenced in INPUT_COLUMN_MAPPING: "
+            + ", ".join(sorted(set(missing_keys)))
+        )
+
+    if not email_cols and not phone_cols and not (address_col and zip_col):
+        raise ValueError(
+            "At least one key source is required: email, phone, or address+zip."
+        )
+
+    logger.info(
+        f"[STEP 5] Key sources: email={email_cols}, phone={phone_cols}, "
+        f"address={address_col}, zip={zip_col}"
+    )
 
     # Optional: filter input by state for test runs
     if STATE_FILTER:
         input_state_col = get_input_column_name("state")
-        logger.info(f"[STEP 5] Filtering imported input to state={STATE_FILTER} using column={input_state_col}")
+        if input_state_col not in df_clean.columns:
+            raise ValueError(
+                f"STATE_FILTER provided but state column not found in input: {input_state_col}"
+            )
+        logger.info(
+            f"[STEP 5] Filtering imported input to state={STATE_FILTER} using column={input_state_col}"
+        )
         df_clean = df_clean.filter(F.upper(F.col(input_state_col)) == F.lit(STATE_FILTER))
 
     # -----------------------------------------------------------------------------------
-    # 6) Prepare input_df and match_df (normalized columns)
+    # 6) Prepare input keys and load match table
     # -----------------------------------------------------------------------------------
-    logger.info("[STEP 6] Preparing normalized columns and loading match table...")
+    logger.info("[STEP 6] Building input keys and loading match table...")
 
-    input_first_col = get_input_column_name("first_name")
-    input_last_col = get_input_column_name("last_name")
-    input_address_col = get_input_column_name("address")
-    input_zip_col = get_input_column_name("zip")
-    input_zip4_col = get_input_column_name("zip4")
+    existing_cols_lower = {c.lower() for c in df_clean.columns}
+    input_row_id_col = make_unique_name("__input_row_id", existing_cols_lower)
+    input_with_id = df_clean.withColumn(input_row_id_col, F.monotonically_increasing_id())
 
-    input_zip_clean = F.trim(F.coalesce(F.col(input_zip_col).cast("string"), F.lit("")))
-    input_zip4_clean = F.trim(F.coalesce(F.col(input_zip4_col).cast("string"), F.lit("")))
-    input_zip_5 = F.substring(input_zip_clean, 1, 5)
-    input_zip4_4 = F.substring(input_zip4_clean, 1, 4)
+    key_structs = []
+    for idx, col_name in enumerate(email_cols):
+        key_structs.append(
+            F.struct(
+                F.lit("email").alias("key_type"),
+                normalize_email(F.col(col_name)).alias("key_value"),
+                F.lit(1).alias("key_priority"),
+                F.lit(idx).alias("key_order"),
+            )
+        )
+    for idx, col_name in enumerate(phone_cols):
+        key_structs.append(
+            F.struct(
+                F.lit("phone").alias("key_type"),
+                normalize_phone(F.col(col_name)).alias("key_value"),
+                F.lit(2).alias("key_priority"),
+                F.lit(idx).alias("key_order"),
+            )
+        )
+    if address_col and zip_col:
+        address_norm = normalize_text(F.col(address_col))
+        zip5 = normalize_zip5(F.col(zip_col))
+        address_key = F.when(
+            address_norm.isNotNull() & zip5.isNotNull(),
+            F.concat_ws(" ", address_norm, zip5),
+        )
+        key_structs.append(
+            F.struct(
+                F.lit("address").alias("key_type"),
+                address_key.alias("key_value"),
+                F.lit(3).alias("key_priority"),
+                F.lit(0).alias("key_order"),
+            )
+        )
 
-    input_df = df_clean.select(
-        "*",
-        F.coalesce(F.col(input_first_col), F.lit("")).alias("first_name_norm"),
-        F.coalesce(F.col(input_last_col), F.lit("")).alias("last_name_norm"),
-        F.coalesce(F.col(input_address_col), F.lit("")).alias("address_norm"),
-        F.when(F.length(input_zip_5) == 0, F.lit(""))
-        .otherwise(F.lpad(input_zip_5, 5, "0"))
-        .alias("zip_norm"),
-        F.when(F.length(input_zip4_4) == 0, F.lit(""))
-        .otherwise(F.lpad(input_zip4_4, 4, "0"))
-        .alias("zip4_norm"),
+    input_keys_df = (
+        input_with_id
+        .withColumn("input_keys", F.array(*key_structs))
+        .withColumn("input_key", F.explode("input_keys"))
+        .select(
+            F.col(input_row_id_col).alias("input_row_id"),
+            F.col("input_key.key_type").alias("key_type"),
+            F.col("input_key.key_value").alias("key_value"),
+            F.col("input_key.key_priority").alias("key_priority"),
+            F.col("input_key.key_order").alias("key_order"),
+            F.col(input_first_col).alias("input_first_name"),
+            F.col(input_last_col).alias("input_last_name"),
+        )
+        .filter(F.col("key_value").isNotNull())
     )
 
+    match_base_df = spark.sql(f"SELECT * FROM {MATCH_TABLE}")
     if STATE_FILTER:
-        match_base_df = spark.sql(
-            f"SELECT * FROM {MATCH_TABLE} WHERE state = '{STATE_FILTER}'"
-        )
-    else:
-        match_base_df = spark.sql(f"SELECT * FROM {MATCH_TABLE}")
+        if "std_state" in match_base_df.columns:
+            match_base_df = match_base_df.filter(F.upper(F.col("std_state")) == F.lit(STATE_FILTER))
+        elif "state" in match_base_df.columns:
+            match_base_df = match_base_df.filter(F.upper(F.col("state")) == F.lit(STATE_FILTER))
+        else:
+            raise ValueError(
+                "STATE_FILTER provided but match table lacks std_state or state column."
+            )
 
     match_base_columns = match_base_df.columns
+    match_col_map = {c.lower(): c for c in match_base_columns}
 
-    # Normalize match dataset
-    match_zip_clean = F.trim(F.coalesce(F.col("zip").cast("string"), F.lit("")))
-    match_zip4_clean = F.trim(F.coalesce(F.col("zip4").cast("string"), F.lit("")))
-    match_zip_5 = F.substring(match_zip_clean, 1, 5)
-    match_zip4_4 = F.substring(match_zip4_clean, 1, 4)
+    def pick_match_col(*candidates):
+        for cand in candidates:
+            actual = match_col_map.get(cand)
+            if actual:
+                return actual
+        return None
 
-    match_df = match_base_df.select(
-        "*",
-        F.coalesce(F.col("first_name"), F.lit("")).alias("first_name_norm"),
-        F.coalesce(F.col("last_name"), F.lit("")).alias("last_name_norm"),
-        F.coalesce(F.col("address"), F.lit("")).alias("address_norm"),
-        F.when(F.length(match_zip_5) == 0, F.lit(""))
-        .otherwise(F.lpad(match_zip_5, 5, "0"))
-        .alias("zip_norm"),
-        F.when(F.length(match_zip4_4) == 0, F.lit(""))
-        .otherwise(F.lpad(match_zip4_4, 4, "0"))
-        .alias("zip4_norm"),
-    )
+    match_key_col = pick_match_col("key")
+    match_key_type_col = pick_match_col("key_type")
+    match_consumer_id_col = pick_match_col("consumer_id")
+    match_uuid_col = pick_match_col("uuid")
+    match_first_col = pick_match_col("first", "first_name")
+    match_last_col = pick_match_col("last", "last_name")
 
-    input_df.createOrReplaceTempView("input_data")
-    match_df.createOrReplaceTempView("match_data")
+    missing_match_cols = []
+    if not match_key_col:
+        missing_match_cols.append("key")
+    if not match_key_type_col:
+        missing_match_cols.append("key_type")
+    if not match_consumer_id_col:
+        missing_match_cols.append("consumer_id")
+    if not match_uuid_col:
+        missing_match_cols.append("uuid")
+    if not match_first_col:
+        missing_match_cols.append("first/first_name")
+    if not match_last_col:
+        missing_match_cols.append("last/last_name")
+    if missing_match_cols:
+        raise ValueError(
+            "Match table is missing required columns: " + ", ".join(missing_match_cols)
+        )
 
-    input_count = input_df.count()
+    match_df = match_base_df.withColumn("match_key_type", F.lower(F.col(match_key_type_col)))
+    match_df = match_df.withColumn(
+        "match_key_norm",
+        F.when(F.col("match_key_type") == F.lit("email"), normalize_email(F.col(match_key_col)))
+        .when(F.col("match_key_type") == F.lit("phone"), normalize_phone(F.col(match_key_col)))
+        .when(F.col("match_key_type") == F.lit("address"), normalize_text(F.col(match_key_col)))
+        .otherwise(F.lit(None)),
+    ).filter(F.col("match_key_type").isin("email", "phone", "address"))
+    match_df = match_df.filter(F.col("match_key_norm").isNotNull())
+
+    input_count = input_with_id.count()
     match_count = match_df.count()
     logger.info(f"[STEP 6] Input count: {input_count:,}")
-    logger.info(f"[STEP 6] Match table count: {match_count:,}")
+    logger.info(f"[STEP 6] Match table count (key rows): {match_count:,}")
+
+    input_with_id.createOrReplaceTempView("input_base")
+    input_keys_df.createOrReplaceTempView("input_keys")
+    match_df.createOrReplaceTempView("match_data")
 
     # -----------------------------------------------------------------------------------
-    # 7) Register UDFs and run matching SQL
+    # 7) Register UDFs and perform key matching with name validation
     # -----------------------------------------------------------------------------------
-    logger.info("[STEP 7] Registering UDFs and performing fuzzy matching...")
+    logger.info("[STEP 7] Registering UDFs and performing key matching (SQL)...")
     spark.udf.register("fuzzy_name_match_udf", fuzzy_match_name_with_first_name, IntegerType())
-    spark.udf.register("fuzzy_address_match_udf", fuzzy_match_address, IntegerType())
 
-    match_threshold = int(MATCH_THRESHOLD)
-    household_threshold = match_threshold
-
-    input_columns = [c for c in input_df.columns if not c.endswith("_norm")]
-    select_input_cols = ", ".join([f"r.{sql_ident(c)}" for c in input_columns])
+    input_columns = [c for c in df_clean.columns]
+    select_input_cols = ", ".join([f"i.{sql_ident(c)}" for c in input_columns])
 
     default_match_output_cols = [
-        "match_id",
-        "match_first_name",
-        "match_last_name",
-        "match_address",
-        "match_zip",
-        "match_zip4",
+        "match_consumer_id",
+        "match_uuid",
+        "match_key",
+        "match_key_type",
+        "match_first",
+        "match_last",
         "match_first_name_score",
         "match_last_name_score",
-        "match_address_score",
         "match_type",
-        "match_overall_score",
+        "match_date",
     ]
     reserved_output_cols = {c.lower() for c in input_columns}
     reserved_output_cols.update(c.lower() for c in default_match_output_cols)
 
-    match_col_map = {c.lower(): c for c in match_base_columns}
     extra_match_cols: list[tuple[str, str]] = []
     skipped_match_cols: list[str] = []
     renamed_match_cols: list[str] = []
@@ -676,24 +847,24 @@ try:
     if match_append_mode != "default":
         if extra_match_cols:
             logger.info(
-                "[STEP 6] Appending match table columns: "
+                "[STEP 7] Appending match table columns: "
                 f"{[output for _, output in extra_match_cols]}"
             )
         else:
-            logger.info("[STEP 6] No extra match table columns appended.")
+            logger.info("[STEP 7] No extra match table columns appended.")
     if renamed_match_cols:
         logger.info(
-            "[STEP 6] Renamed match table columns due to collisions: "
+            "[STEP 7] Renamed match table columns due to collisions: "
             f"{renamed_match_cols}"
         )
     if skipped_match_cols:
-        logger.warning(f"[STEP 6] Skipped match table columns: {skipped_match_cols}")
+        logger.warning(f"[STEP 7] Skipped match table columns: {skipped_match_cols}")
 
     extra_match_select = ""
     if extra_match_cols:
-        extra_match_select = "\n                " + "\n                ".join(
+        extra_match_select = ",\n                " + ",\n                ".join(
             [
-                f"c.{sql_ident(source)} AS {sql_ident(output)},"
+                f"m.{sql_ident(source)} AS {sql_ident(output)}"
                 for source, output in extra_match_cols
             ]
         )
@@ -704,127 +875,98 @@ try:
             [f"r.{sql_ident(output)}" for _, output in extra_match_cols]
         )
 
-    part_cols = ", ".join(
-        [
-            sql_ident(input_first_col),
-            sql_ident(input_last_col),
-            sql_ident(input_address_col),
-            sql_ident(input_zip_col),
-            sql_ident(input_zip4_col),
-        ]
-    )
+    match_threshold = int(MATCH_THRESHOLD)
+    input_row_id_ident = sql_ident(input_row_id_col)
+    match_consumer_id_ident = sql_ident(match_consumer_id_col)
+    match_uuid_ident = sql_ident(match_uuid_col)
+    match_key_ident = sql_ident(match_key_col)
+    match_first_ident = sql_ident(match_first_col)
+    match_last_ident = sql_ident(match_last_col)
 
     result_df = spark.sql(
         f"""
-        WITH first_name_matches AS (
+        WITH key_matches AS (
             SELECT
-                i.*,
-                c.id                         AS match_id,
-                c.first_name                 AS match_first_name,
-                c.first_name_norm            AS match_first_name_norm,
-                c.last_name                  AS match_last_name,
-                c.last_name_norm             AS match_last_name_norm,
-                c.address                    AS match_address,
-                c.address_norm               AS match_address_norm,
-                c.zip                        AS match_zip,
-                c.zip4                       AS match_zip4,
-                c.zip_norm                   AS match_zip_norm,
-                c.zip4_norm                  AS match_zip4_norm,{extra_match_select}
+                k.input_row_id,
+                k.key_type,
+                k.key_value,
+                k.key_priority,
+                k.key_order,
+                k.input_first_name,
+                k.input_last_name,
+                m.{match_consumer_id_ident} AS match_consumer_id,
+                m.{match_uuid_ident} AS match_uuid,
+                m.{match_key_ident} AS match_key,
+                m.match_key_type AS match_key_type,
+                m.{match_first_ident} AS match_first,
+                m.{match_last_ident} AS match_last{extra_match_select},
                 CASE
-                    WHEN i.first_name_norm = '' OR c.first_name_norm = '' THEN 0
-                    ELSE fuzzy_name_match_udf(i.first_name_norm, c.first_name_norm, false, 0)
-                END                          AS raw_first_name_score
-            FROM input_data i
-            LEFT JOIN match_data c
-              ON i.zip_norm = c.zip_norm
-             AND i.zip4_norm = c.zip4_norm
+                    WHEN k.input_first_name IS NULL OR m.{match_first_ident} IS NULL THEN 0
+                    ELSE fuzzy_name_match_udf(k.input_first_name, m.{match_first_ident}, false, 0)
+                END AS raw_first_name_score
+            FROM input_keys k
+            JOIN match_data m
+              ON k.key_value = m.match_key_norm
+             AND k.key_type = m.match_key_type
         ),
-        address_matches AS (
+        name_matches AS (
             SELECT
-                f.*,
+                km.*,
                 CASE
-                    WHEN f.last_name_norm = '' OR f.match_last_name_norm = '' THEN 0
+                    WHEN km.input_last_name IS NULL OR km.match_last IS NULL THEN 0
                     ELSE fuzzy_name_match_udf(
-                           f.last_name_norm,
-                           f.match_last_name_norm,
-                           true,
-                           f.raw_first_name_score
-                         )
-                END                          AS raw_last_name_score,
-                CASE
-                    WHEN f.address_norm = ''
-                      OR f.match_address_norm = ''
-                      OR f.zip_norm = ''
-                      OR f.match_zip_norm = ''
-                    THEN 0
-                    ELSE fuzzy_address_match_udf(
-                           f.address_norm,
-                           f.match_address_norm,
-                           f.zip_norm,
-                           f.match_zip_norm
-                         )
-                END                          AS raw_address_score
-            FROM first_name_matches f
+                        km.input_last_name,
+                        km.match_last,
+                        true,
+                        km.raw_first_name_score
+                    )
+                END AS raw_last_name_score
+            FROM key_matches km
         ),
         match_types AS (
             SELECT
                 *,
+                (raw_first_name_score + raw_last_name_score) / 2.0 AS match_overall_score,
                 CASE
                     WHEN raw_first_name_score >= {match_threshold}
                       AND raw_last_name_score >= {match_threshold}
-                      AND raw_address_score >= {match_threshold}
                     THEN 'INDIVIDUAL_MATCH'
-                    WHEN raw_last_name_score >= {household_threshold}
-                      AND raw_address_score >= {match_threshold}
+                    WHEN raw_last_name_score >= {match_threshold}
                     THEN 'HOUSEHOLD_MATCH'
-                    WHEN raw_address_score >= {match_threshold}
-                    THEN 'ADDRESS_MATCH'
-                    ELSE 'NO_MATCH'
-                END                          AS match_type,
-                CASE
-                    WHEN raw_first_name_score >= {match_threshold}
-                      AND raw_last_name_score >= {match_threshold}
-                      AND raw_address_score >= {match_threshold}
-                    THEN (raw_first_name_score + raw_last_name_score + raw_address_score) / 3
-                    WHEN raw_last_name_score >= {household_threshold}
-                      AND raw_address_score >= {match_threshold}
-                    THEN (raw_last_name_score + raw_address_score) / 2
-                    ELSE raw_address_score
-                END                          AS match_overall_score
-            FROM address_matches
+                    ELSE 'KEY_MATCH'
+                END AS match_type
+            FROM name_matches
         ),
         ranked_matches AS (
             SELECT
                 *,
                 ROW_NUMBER() OVER (
-                    PARTITION BY {part_cols}
+                    PARTITION BY input_row_id
                     ORDER BY
-                        CASE match_type
-                            WHEN 'INDIVIDUAL_MATCH' THEN 1
-                            WHEN 'HOUSEHOLD_MATCH' THEN 2
-                            WHEN 'ADDRESS_MATCH' THEN 3
-                            ELSE 4
-                        END,
-                        match_overall_score DESC
+                        key_priority,
+                        key_order,
+                        match_overall_score DESC,
+                        COALESCE(CAST(match_consumer_id AS STRING), ''),
+                        COALESCE(CAST(match_uuid AS STRING), '')
                 ) AS match_rank
             FROM match_types
-            WHERE match_type != 'NO_MATCH'
         )
         SELECT
             {select_input_cols},
-            r.match_id,
-            r.match_first_name,
-            r.match_last_name,
-            r.match_address,
-            r.match_zip,
-            r.match_zip4,
-            r.raw_first_name_score    AS match_first_name_score,
-            r.raw_last_name_score     AS match_last_name_score,
-            r.raw_address_score       AS match_address_score,
+            r.match_consumer_id,
+            r.match_uuid,
+            r.match_key,
+            r.match_key_type,
+            r.match_first,
+            r.match_last,
+            r.raw_first_name_score AS match_first_name_score,
+            r.raw_last_name_score AS match_last_name_score,
             r.match_type,
-            r.match_overall_score{extra_final_select}
-        FROM ranked_matches r
-        WHERE r.match_rank = 1
+            current_date() AS match_date{extra_final_select}
+        FROM input_base i
+        LEFT JOIN ranked_matches r
+          ON i.{input_row_id_ident} = r.input_row_id
+         AND r.match_rank = 1
         """
     )
 
@@ -854,5 +996,3 @@ try:
 except Exception as e:
     logger.error(f"[FATAL] Job failed with error: {str(e)}")
     raise
-
-

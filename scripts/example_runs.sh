@@ -21,5 +21,17 @@ aws glue start-job-run \
       "--OUTPUT_PATH": "s3://lsc-databases/clients/<my-new-table-location>/",
       "--OUTPUT_TABLE": "<target-database>.<target-table>",
       "--MATCH_THRESHOLD": "92",
-      "--INPUT_COLUMN_MAPPING": "{\"first_name\":\"firstname\",\"last_name\":\"lastname\",\"address\":\"street\",\"city\":\"city\",\"state\":\"state\",\"zip\":\"zipcode\",\"zip4\":\"plus4\"}"
+      "--INPUT_COLUMN_MAPPING": "{\"first_name\":\"FIRSTNAME\",\"last_name\":\"LASTNAME\",\"address\":\"bc_std_street\",\"city\":\"bc_std_city\",\"state\":\"bc_std_state\",\"zip\":\"bc_std_zip\",\"zip4\":\"bc_std_zip_4\",\"email\":\"BUSINESSEMAIL,PERSONALEMAIL\",\"phone\":\"BUSINESSPHONE1,BUSINESSPHONE2,MOBILEPHONE,HOMEPHONE\"}"
+  }'
+
+# Start a list import + key match job (email/phone/address)
+aws glue start-job-run \
+  --job-name match-consumer-key \
+  --arguments '{
+    "--INPUT_S3_PATH": "s3://bluecontact-sftp2/linqd/match-stage/output/2026-02-24/",
+    "--MATCH_TABLE": "bluecontact.consumer_key_a",
+    "--OUTPUT_PATH": "s3://blue-datasets/tables/linqd_202602_matched/",
+    "--OUTPUT_TABLE": "my_tables.linqd_202602_matched",
+    "--MATCH_THRESHOLD": "92",
+    "--INPUT_COLUMN_MAPPING": "{\"first_name\":\"FIRSTNAME\",\"last_name\":\"LASTNAME\",\"address\":\"bc_std_street\",\"city\":\"bc_std_city\",\"state\":\"bc_std_state\",\"zip\":\"bc_std_zip\",\"zip4\":\"bc_std_zip_4\",\"email\":\"BUSINESSEMAIL,PERSONALEMAIL\",\"phone\":\"BUSINESSPHONE1,BUSINESSPHONE2,MOBILEPHONE,HOMEPHONE\"}"
   }'
