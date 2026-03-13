@@ -116,7 +116,7 @@ The output table includes:
 
 - **All imported columns** from the input file
 - Match result columns:
-  - `match_consumer_id`, `match_uuid`, `match_key`, `match_key_type`
+- `match_consumer_id`, `match_uuid`, `match_source_id`, `match_key`, `match_key_type`
   - `match_first`, `match_last`
   - `match_first_name_score`, `match_last_name_score`
   - `match_type`, `match_date`

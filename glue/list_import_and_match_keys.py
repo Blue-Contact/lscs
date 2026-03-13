@@ -747,6 +747,7 @@ try:
     match_key_type_col = pick_match_col("key_type")
     match_consumer_id_col = pick_match_col("consumer_id")
     match_uuid_col = pick_match_col("uuid")
+    match_source_id_col = pick_match_col("source_id", "match_source_id")
     match_first_col = pick_match_col("first", "first_name")
     match_last_col = pick_match_col("last", "last_name")
 
@@ -767,6 +768,8 @@ try:
         raise ValueError(
             "Match table is missing required columns: " + ", ".join(missing_match_cols)
         )
+    if not match_source_id_col:
+        logger.warning("[STEP 6] Match table missing source_id; match_source_id will be NULL.")
 
     match_df = match_base_df.withColumn("match_key_type", F.lower(F.col(match_key_type_col)))
     match_df = match_df.withColumn(
@@ -799,6 +802,7 @@ try:
     default_match_output_cols = [
         "match_consumer_id",
         "match_uuid",
+        "match_source_id",
         "match_key",
         "match_key_type",
         "match_first",
@@ -813,15 +817,21 @@ try:
 
     extra_match_cols: list[tuple[str, str]] = []
     skipped_match_cols: list[str] = []
+    already_output_cols: list[str] = []
     renamed_match_cols: list[str] = []
     existing_output_cols = set(reserved_output_cols)
+    default_output_cols_lower = {c.lower() for c in default_match_output_cols}
 
     if match_append_mode == "all":
         candidates = list(match_base_columns)
     elif match_append_mode == "list":
         candidates = []
         for raw_col in match_append_requested:
-            actual = match_col_map.get(raw_col.lower())
+            raw_key = raw_col.lower()
+            if raw_key in default_output_cols_lower:
+                already_output_cols.append(raw_col)
+                continue
+            actual = match_col_map.get(raw_key)
             if not actual:
                 skipped_match_cols.append(f"{raw_col} (not in match table)")
                 continue
@@ -859,6 +869,11 @@ try:
         )
     if skipped_match_cols:
         logger.warning(f"[STEP 7] Skipped match table columns: {skipped_match_cols}")
+    if already_output_cols:
+        logger.info(
+            "[STEP 7] MATCH_APPEND_COLUMNS already in default output: "
+            f"{already_output_cols}"
+        )
 
     extra_match_select = ""
     if extra_match_cols:
@@ -879,9 +894,15 @@ try:
     input_row_id_ident = sql_ident(input_row_id_col)
     match_consumer_id_ident = sql_ident(match_consumer_id_col)
     match_uuid_ident = sql_ident(match_uuid_col)
+    match_source_id_ident = sql_ident(match_source_id_col) if match_source_id_col else None
     match_key_ident = sql_ident(match_key_col)
     match_first_ident = sql_ident(match_first_col)
     match_last_ident = sql_ident(match_last_col)
+    match_source_id_select = (
+        f"\n                m.{match_source_id_ident} AS match_source_id,"
+        if match_source_id_ident
+        else "\n                CAST(NULL AS STRING) AS match_source_id,"
+    )
 
     result_df = spark.sql(
         f"""
@@ -896,6 +917,7 @@ try:
                 k.input_last_name,
                 m.{match_consumer_id_ident} AS match_consumer_id,
                 m.{match_uuid_ident} AS match_uuid,
+                {match_source_id_select}
                 m.{match_key_ident} AS match_key,
                 m.match_key_type AS match_key_type,
                 m.{match_first_ident} AS match_first,
@@ -955,6 +977,7 @@ try:
             {select_input_cols},
             r.match_consumer_id,
             r.match_uuid,
+            r.match_source_id,
             r.match_key,
             r.match_key_type,
             r.match_first,
