@@ -2,11 +2,10 @@
 aws glue start-job-run \
   --job-name ListImport \
   --arguments '{
-    "--INPUT_S3_PATH":"s3://blue-imports/consumer_property_202512/",
-    "--OUTPUT_S3_PATH":"s3://blue-glue-tables/source_a/consumer_property/",
-    "--OUTPUT_DATABASE":"source_a",
-    "--OUTPUT_TABLE":"consumer_property",
-    "--INPUT_DELIMITER":"pipe"
+    "--INPUT_S3_PATH":"s3://lsc-imports/dnb/DNB_Texas_100K_csv/",
+    "--OUTPUT_S3_PATH":"s3://lsc-databases/lsc/DNB_Texas_100K/",
+    "--OUTPUT_DATABASE":"lsc",
+    "--OUTPUT_TABLE":"DNB_Texas_100K"
   }'
 
 # Start a consumer match job
@@ -17,12 +16,24 @@ aws glue start-job-run \
 aws glue start-job-run \
   --job-name consumer-match-job \
   --arguments '{
-      "--INPUT_TABLE": "database_name.table_name",
-      "--MATCH_TABLE": "source_a.consumer",
-      "--OUTPUT_PATH": "s3://lsc-databases/clients/<my-new-table-location>/",
-      "--OUTPUT_TABLE": "<target-database>.<target-table>",
+      "--INPUT_TABLE": "source_b.b2c",
+      "--MATCH_TABLE": "source_a.consumer_data",
+      "--OUTPUT_PATH": "s3://lsc-databases/source_b/b2c_matched/",
+      "--OUTPUT_TABLE": "source_b.b2c_matched",
       "--MATCH_THRESHOLD": "92",
-      "--INPUT_COLUMN_MAPPING": "{\"first_name\":\"FIRSTNAME\",\"last_name\":\"LASTNAME\",\"address\":\"bc_std_street\",\"city\":\"bc_std_city\",\"state\":\"bc_std_state\",\"zip\":\"bc_std_zip\",\"zip4\":\"bc_std_zip_4\",\"email\":\"BUSINESSEMAIL,PERSONALEMAIL\",\"phone\":\"BUSINESSPHONE1,BUSINESSPHONE2,MOBILEPHONE,HOMEPHONE\"}"
+      "--INPUT_COLUMN_MAPPING": "{\"first_name\":\"first\",\"last_name\":\"last\",\"address\":\"std_address\",\"city\":\"std_city\",\"state\":\"std_state\",\"zip\":\"std_zip\",\"zip4\":\"std_zip4\"}"
+  }'
+
+aws glue start-job-run \
+  --job-name consumer-match-job \
+  --arguments '{
+    "--INPUT_TABLE": "clients.ct0310b_sabel",
+    "--MATCH_TABLE": "source_b.b2c",
+    "--OUTPUT_PATH": "s3://lsc-databases/clients/ct0310b_sabel_matched/",
+    "--OUTPUT_TABLE": "clients.ct0310b_sabel_matched",
+    "--MATCH_THRESHOLD": "92",
+    "--INPUT_COLUMN_MAPPING": "{\"first_name\": \"first_name\", \"last_name\": \"last_name\", \"address\": \"address\", \"city\": \"city\", \"state\": \"state\", \"zip\": \"zip\", \"zip4\": \"zip4\"}",
+    "--MATCH_COLUMN_MAPPING": "{\"id\": \"pid\", \"first_name\": \"first\", \"last_name\": \"last\", \"address\": \"std_address\", \"state\": \"std_state\", \"zip\": \"std_zip\", \"zip4\": \"std_zip4\"}"
   }'
 
 # Start a list import + key match job (email/phone/address)
@@ -81,10 +92,8 @@ aws glue start-job-run \
 
 # With optional state filter and output partition control
 aws glue start-job-run \
-  --job-name dnb-fixed-width-to-csv \
+  --job-name lsc-fixed-width-to-csv \
   --arguments '{
-    "--INPUT_S3_PATH": "s3://blue-imports/dnb/202603/",
-    "--OUTPUT_S3_PATH": "s3://blue-datasets/dnb/202603_csv_tx/",
-    "--STATE_FILTER": "TX",
-    "--COALESCE": "1"
+    "--INPUT_S3_PATH": "s3://lsc-imports/dnb/DNB_Texas_100K.txt",
+    "--OUTPUT_S3_PATH": "s3://lsc-imports/dnb/DNB_Texas_100K_csv/"
   }'

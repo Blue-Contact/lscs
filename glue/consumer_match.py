@@ -406,6 +406,36 @@ missing_columns = [col for col in required_columns if col not in input_column_ma
 if missing_columns:
     raise ValueError(f"Missing required consumer table columns in INPUT_COLUMN_MAPPING: {missing_columns}")
 
+# Parse optional MATCH_COLUMN_MAPPING JSON (defaults to standard consumer table column names)
+default_match_mapping = {
+    'id': 'id',
+    'first_name': 'first_name',
+    'last_name': 'last_name',
+    'address': 'address',
+    'state': 'state',
+    'zip': 'zip',
+    'zip4': 'zip4'
+}
+try:
+    optional_match_args = getResolvedOptions(sys.argv, ['MATCH_COLUMN_MAPPING'])
+    raw_match_mapping = optional_match_args['MATCH_COLUMN_MAPPING']
+except:
+    raw_match_mapping = None
+
+if raw_match_mapping:
+    try:
+        match_column_mapping = json.loads(raw_match_mapping)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in MATCH_COLUMN_MAPPING parameter: {e}")
+    print(f"Match column mapping provided: {match_column_mapping}")
+    required_match_columns = ['id', 'first_name', 'last_name', 'address', 'state', 'zip', 'zip4']
+    missing_match_columns = [c for c in required_match_columns if c not in match_column_mapping]
+    if missing_match_columns:
+        raise ValueError(f"Missing required columns in MATCH_COLUMN_MAPPING: {missing_match_columns}")
+else:
+    match_column_mapping = default_match_mapping
+    print("No MATCH_COLUMN_MAPPING provided, using default column names")
+
 print(f"Parsed arguments: {args}")
 
 # ==========================================
@@ -427,9 +457,9 @@ try:
         """Get the actual input table column name using column mapping."""
         return input_column_mapping.get(standard_col_name, standard_col_name)
 
-    def get_match_column_name(col_name):
-        """Get the match table column name (no mapping needed).""" 
-        return col_name
+    def get_match_column_name(standard_col_name):
+        """Get the actual match table column name using column mapping."""
+        return match_column_mapping.get(standard_col_name, standard_col_name)
 
     # ==========================================
     # Clean Previous Output from S3
@@ -493,12 +523,13 @@ try:
 
     logger.info("Reading match table...")
     # Read match table with optional state filtering
+    match_state_col = get_match_column_name('state')
     if args.get('STATE_FILTER'):
         state_filter = args['STATE_FILTER']
         logger.info(f"Loading match data filtered by state: {state_filter}")
         match_df = spark.sql(f"""
             SELECT * FROM {args['MATCH_TABLE']} 
-            WHERE state = '{state_filter}'
+            WHERE {match_state_col} = '{state_filter}'
         """)
     else:
         logger.info("Loading full match dataset")
@@ -514,6 +545,13 @@ try:
 
     # Log potential comparison pairs
     logger.info(f"Potential comparison pairs (without blocking): {input_count * match_count:,}")
+
+    # ==========================================
+    # Rename Match Table Columns to Standard Names
+    # ==========================================
+    for standard_name, actual_name in match_column_mapping.items():
+        if actual_name != standard_name and actual_name in match_df.columns:
+            match_df = match_df.withColumnRenamed(actual_name, standard_name)
 
     # ==========================================
     # Normalize Data Using Column Mapping
