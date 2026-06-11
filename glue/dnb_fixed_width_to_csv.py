@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # DNB fixed-width column layout (DNB_Updated_Layout_0226)
 # Each tuple: (column_name, 1-based start position, length)
-# Spark's F.substring is 1-indexed, so positions map directly.
+# Total record length: 790 characters
 # ---------------------------------------------------------------------------
 DNB_LAYOUT = [
     ("duns_number",                  1,   9),
@@ -66,9 +66,6 @@ DNB_LAYOUT = [
     ("ceo_name",                   389,  30),
     ("ceo_name_suffix",            419,   3),
     ("ceo_title",                  422,  30),
-    # Wire format 452-461 is one 10-digit national number (often NPA+NXX+XXXX).
-    # area_code + telephone_number follow the D&B 3+7 split; telephone_number is
-    # the 7-digit local portion only (may share leading digits with the area code).
     ("area_code",                  452,   3),
     ("telephone_number",           455,   7),
     ("phone_national_10",          452,  10),
@@ -137,13 +134,19 @@ if any(arg.startswith("--STATE_FILTER") for arg in sys.argv):
     optional_args.append("STATE_FILTER")
 if any(arg.startswith("--COALESCE") for arg in sys.argv):
     optional_args.append("COALESCE")
+if any(arg.startswith("--REPARTITION") for arg in sys.argv):
+    optional_args.append("REPARTITION")
 
 args = getResolvedOptions(sys.argv, required_args + optional_args)
 
 INPUT_S3_PATH  = args["INPUT_S3_PATH"]
 OUTPUT_S3_PATH = args["OUTPUT_S3_PATH"]
 STATE_FILTER   = args.get("STATE_FILTER")
-COALESCE       = int(args.get("COALESCE", "1"))
+# COALESCE=0 (default) means: do not coalesce. Only coalesce when explicitly requested.
+COALESCE       = int(args.get("COALESCE", "0"))
+# REPARTITION=400 guarantees parallelism on the single-file read even if S3 split
+# detection is wonky. Set to 0 to skip the repartition.
+REPARTITION    = int(args.get("REPARTITION", "400"))
 
 if STATE_FILTER and (len(STATE_FILTER) != 2 or not STATE_FILTER.isalpha()):
     raise ValueError(f"STATE_FILTER must be a 2-letter state code, got: {STATE_FILTER!r}")
@@ -157,60 +160,53 @@ spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args["JOB_NAME"], args)
 
+# Ensure the single 50 GB file is split into reasonable chunks.
+spark.conf.set("spark.sql.files.maxPartitionBytes", "134217728")  # 128 MB
+spark.conf.set("spark.sql.files.openCostInBytes",   "4194304")     # 4 MB
+spark.conf.set("spark.sql.adaptive.enabled",        "true")
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+
 logger.info("[INIT] Job name:       %s", args["JOB_NAME"])
 logger.info("[INIT] INPUT_S3_PATH:  %s", INPUT_S3_PATH)
 logger.info("[INIT] OUTPUT_S3_PATH: %s", OUTPUT_S3_PATH)
 logger.info("[INIT] STATE_FILTER:   %s", STATE_FILTER or "(none)")
 logger.info("[INIT] COALESCE:       %d", COALESCE)
+logger.info("[INIT] REPARTITION:    %d", REPARTITION)
 logger.info("[INIT] Layout columns: %d", len(DNB_LAYOUT))
 
 try:
     # ------------------------------------------------------------------
-    # STEP 1 - Read raw lines from S3
+    # STEP 1 - Read raw lines from S3 (no counts, no isEmpty)
     # ------------------------------------------------------------------
     logger.info("[STEP 1] Reading fixed-width input from %s", INPUT_S3_PATH)
-
     lines_df = spark.read.text(INPUT_S3_PATH)
 
-    if lines_df.rdd.isEmpty():
-        raise RuntimeError(f"No data found at INPUT_S3_PATH={INPUT_S3_PATH}")
-
-    total_lines = lines_df.count()
-    logger.info("[STEP 1] Read %d line(s)", total_lines)
+    if REPARTITION > 0:
+        logger.info("[STEP 1] Repartitioning to %d partitions to force parallelism", REPARTITION)
+        lines_df = lines_df.repartition(REPARTITION)
 
     # ------------------------------------------------------------------
     # STEP 2 - Parse fixed-width fields via F.substring
     # ------------------------------------------------------------------
     logger.info("[STEP 2] Parsing %d fixed-width columns", len(DNB_LAYOUT))
-
     select_exprs = [
         F.substring(F.col("value"), start, length).alias(name)
         for name, start, length in DNB_LAYOUT
     ]
     df_parsed = lines_df.select(select_exprs)
 
-    logger.info("[STEP 2] Parsed schema:")
-    df_parsed.printSchema()
-
     # ------------------------------------------------------------------
-    # STEP 3 - Trim whitespace and convert blanks to NULL
+    # STEP 3 - Trim whitespace + null blanks in a SINGLE select pass.
+    # Also drops the "blank" placeholder column (positions 472-481).
     # ------------------------------------------------------------------
-    logger.info("[STEP 3] Trimming whitespace and converting blanks to NULL")
-
-    for col_name in df_parsed.columns:
-        df_parsed = df_parsed.withColumn(
-            col_name,
-            F.when(
-                F.length(F.trim(F.col(col_name))) == 0,
-                F.lit(None),
-            ).otherwise(F.trim(F.col(col_name))),
-        )
-
-    # Drop the "blank" placeholder column (positions 472-481)
-    df_clean = df_parsed.drop("blank")
-
-    clean_count = df_clean.count()
-    logger.info("[STEP 3] Cleaned %d row(s), %d columns", clean_count, len(df_clean.columns))
+    logger.info("[STEP 3] Trimming whitespace and converting blanks to NULL (single pass)")
+    df_clean = df_parsed.select([
+        F.when(F.length(F.trim(F.col(c))) == 0, F.lit(None))
+         .otherwise(F.trim(F.col(c)))
+         .alias(c)
+        for c in df_parsed.columns
+        if c != "blank"
+    ])
 
     # ------------------------------------------------------------------
     # STEP 4 - Optional state filter
@@ -220,24 +216,25 @@ try:
         df_clean = df_clean.filter(
             F.upper(F.col("physical_state")) == STATE_FILTER.upper()
         )
-        filtered_count = df_clean.count()
-        logger.info("[STEP 4] %d row(s) after state filter", filtered_count)
     else:
         logger.info("[STEP 4] No STATE_FILTER — skipping")
 
     # ------------------------------------------------------------------
     # STEP 5 - Write CSV to S3
     # ------------------------------------------------------------------
-    logger.info("[STEP 5] Writing CSV to %s (coalesce=%d)", OUTPUT_S3_PATH, COALESCE)
+    writer = df_clean
+    if COALESCE > 0:
+        logger.info("[STEP 5] Coalescing to %d partition(s) before write", COALESCE)
+        writer = writer.coalesce(COALESCE)
 
-    df_clean.coalesce(COALESCE).write.csv(
+    logger.info("[STEP 5] Writing CSV to %s", OUTPUT_S3_PATH)
+    writer.write.csv(
         OUTPUT_S3_PATH,
         header=True,
         mode="overwrite",
         quote='"',
         escape='"',
     )
-
     logger.info("[STEP 5] CSV write complete")
 
     job.commit()

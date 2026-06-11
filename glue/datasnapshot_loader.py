@@ -1,7 +1,10 @@
 import sys
 import re
+import time
 import boto3
 import pyarrow as pa
+from typing import Optional
+from botocore.exceptions import ClientError
 import pyarrow.parquet as pq
 import pyarrow.fs as pafs
 from awsglue.utils import getResolvedOptions
@@ -96,6 +99,31 @@ def _create_glue_parquet_snapshot_table(
             },
         },
     )
+
+
+def _verify_glue_table_visible(glue_client, database_name: str, table_name: str) -> None:
+    """Poll GetTable after CreateTable in case of catalog propagation lag."""
+    interval_sec = 2.0
+    attempts = 15
+    last_err: Optional[BaseException] = None
+    for i in range(attempts):
+        try:
+            glue_client.get_table(DatabaseName=database_name, Name=table_name)
+            if i:
+                print(
+                    f"Glue table {database_name}.{table_name} visible after "
+                    f"{i + 1} GetTable attempts."
+                )
+            return
+        except glue_client.exceptions.EntityNotFoundException as err:
+            last_err = err
+            time.sleep(interval_sec)
+    raise RuntimeError(
+        f"glue.create_table finished but GetTable still returns NOT FOUND for "
+        f"{database_name}.{table_name} after ~{attempts * interval_sec:.0f}s. "
+        "Confirm region and account match the Glue Data Catalog, Lake Formation allows access, "
+        "and IAM permits glue:GetTable."
+    ) from last_err
 
 
 args = getResolvedOptions(sys.argv, [
@@ -222,15 +250,29 @@ if args['schema_check_mode'] != 'skip':
         print(f"Table {args['table_name']} doesn't exist yet — skipping schema check (first load)")
 
 if not table_exists:
-    print(f"Creating Glue table {args['database_name']}.{args['table_name']} (external Parquet, partition snapshot_date)...")
-    _create_glue_parquet_snapshot_table(
-        glue,
-        database_name=args['database_name'],
-        table_name=args['table_name'],
-        target_bucket=target_bucket,
-        target_prefix_base=args['target_prefix'],
-        arrow_schema=source_arrow_schema,
+    print(
+        f"Creating Glue table {args['database_name']}.{args['table_name']} "
+        "(external Parquet, partition snapshot_date)..."
     )
+    try:
+        _create_glue_parquet_snapshot_table(
+            glue,
+            database_name=args['database_name'],
+            table_name=args['table_name'],
+            target_bucket=target_bucket,
+            target_prefix_base=args['target_prefix'],
+            arrow_schema=source_arrow_schema,
+        )
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code', '')
+        if code == 'AlreadyExistsException':
+            print(
+                f"Table {args['database_name']}.{args['table_name']} already exists "
+                "(concurrent or prior run); continuing."
+            )
+        else:
+            raise
+    _verify_glue_table_visible(glue, args['database_name'], args['table_name'])
 
 # --- Step 4: Copy Parquet files (server-side) ---
 copied_keys = []
@@ -256,7 +298,17 @@ except Exception as e:
     raise e
 
 # --- Step 5: Register partition ---
-table = glue.get_table(DatabaseName=args['database_name'], Name=args['table_name'])['Table']
+try:
+    table = glue.get_table(DatabaseName=args['database_name'], Name=args['table_name'])['Table']
+except glue.exceptions.EntityNotFoundException as e:
+    raise RuntimeError(
+        f"Glue GetTable failed for {args['database_name']}.{args['table_name']} while registering "
+        f"partition snapshot_date={args['snapshot_date']}. "
+        "If CloudWatch logs never printed 'Creating Glue table', this Glue job is probably still "
+        "running an older script without auto-create — redeploy the latest datasnapshot_loader.py. "
+        "Otherwise confirm the Glue database exists, names match job arguments, region is correct, "
+        "and IAM allows glue:CreateTable and glue:GetTable."
+    ) from e
 storage_descriptor = table['StorageDescriptor'].copy()
 storage_descriptor['Location'] = f"s3://{target_bucket}/{target_prefix}"
 
